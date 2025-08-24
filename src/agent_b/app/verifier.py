@@ -10,18 +10,12 @@ from docx import Document
 from PyPDF2 import PdfReader
 import google.generativeai as genai
 from cachetools import cached, TTLCache
+from typing import List, Tuple # Import Tuple for type hinting
 
 # --- 1. Configuration and Setup ---
 
 # Set up structured logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# High-impact clauses for a winning hackathon project
-CLAUSES_TO_CHECK = [
-    "Indemnification", "Limitation of Liability", "Intellectual Property Rights",
-    "Confidentiality", "Termination for Cause", "Governing Law & Jurisdiction",
-    "Data Privacy & Security", "Force Majeure"
-]
 
 # Set up a cache to store results for 1 hour (3600 seconds)
 cache = TTLCache(maxsize=100, ttl=3600)
@@ -62,9 +56,10 @@ def extract_text_from_image(image_bytes: bytes) -> str:
 
 # --- 3. AI Analysis and Feature Functions ---
 
-def generate_hackathon_llm_prompt(contract_text: str) -> str:
-    """Constructs a prompt that forces reasoning, risk scoring, and justifications."""
-    clauses_list_str = ", ".join(f'"{clause}"' for clause in CLAUSES_TO_CHECK)
+# Modified to accept clauses_to_check as a parameter
+def generate_hackathon_llm_prompt(contract_text: str, clauses_to_check: List[str]) -> str:
+    """Constructs a prompt that forces reasoning, risk scoring, and justifications for dynamic clauses."""
+    clauses_list_str = ", ".join(f'"{clause}"' for clause in clauses_to_check)
     
     prompt = f"""
     You are an expert AI paralegal specializing in contract risk analysis for high-stakes corporate agreements.
@@ -96,13 +91,17 @@ def generate_hackathon_llm_prompt(contract_text: str) -> str:
     """
     return prompt
 
+# Modified to accept clauses_to_check as a parameter. Now expects a hashable type.
 @cached(cache)
-async def analyze_contract_text(contract_text: str, api_key: str):
-    """Asynchronously analyzes contract text using the Gemini LLM with the advanced prompt."""
+async def analyze_contract_text(contract_text: str, api_key: str, clauses_to_check: Tuple[str, ...]): # Expects a Tuple
+    """Asynchronously analyzes contract text using the Gemini LLM with the advanced prompt and dynamic clauses."""
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = generate_hackathon_llm_prompt(contract_text)
+        # Pass clauses_to_check (which is now a tuple) to the prompt generation.
+        # It's fine for prompt generation to convert it back to a list if needed internally,
+        # as the cache key has already been generated based on the tuple.
+        prompt = generate_hackathon_llm_prompt(contract_text, list(clauses_to_check))
         
         logging.info("Generating content with Gemini API using advanced prompt...")
         response = await model.generate_content_async(prompt)
@@ -190,9 +189,11 @@ async def answer_contract_question(contract_text: str, user_question: str, api_k
 
 # --- 4. Main Entrypoint Function ---
 
-async def verify_contract_clauses(file_bytes: bytes, content_type: str, api_key: str):
+# Modified to accept clauses_to_check as a parameter
+async def verify_contract_clauses(file_bytes: bytes, content_type: str, api_key: str, clauses_to_check: List[str]):
     """
     Main function to verify a contract. It extracts text and sends it for AI analysis.
+    Now accepts a dynamic list of clauses to check.
     """
     text = ""
     if content_type == "application/pdf":
@@ -207,5 +208,8 @@ async def verify_contract_clauses(file_bytes: bytes, content_type: str, api_key:
     if not text:
         return {"error": "Could not extract any text from the uploaded file."}
 
-    # Pass the API key to the analysis function
-    return await analyze_contract_text(text, api_key)
+    # Convert clauses_to_check to a tuple BEFORE passing it to the cached function
+    hashable_clauses_to_check = tuple(clauses_to_check)
+    
+    # Pass the API key AND the hashable tuple to the analysis function
+    return await analyze_contract_text(text, api_key, hashable_clauses_to_check)

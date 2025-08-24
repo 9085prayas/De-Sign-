@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 import asyncio
+from typing import List
 
 # Import all the necessary functions from your powerful verifier
 from verifier import (
@@ -10,7 +11,7 @@ from verifier import (
     verify_contract_clauses,
     generate_clause_suggestion,
     generate_plain_english_summary,
-    answer_contract_question  # Import the new Q&A function
+    answer_contract_question
 )
 
 # --- Page Configuration ---
@@ -21,16 +22,21 @@ st.set_page_config(
 )
 
 # --- Initialize Session State ---
-# This is crucial for making the app interactive without losing data.
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = None
 if "contract_text" not in st.session_state:
     st.session_state.contract_text = None
 if "summary" not in st.session_state:
     st.session_state.summary = None
-if "messages" not in st.session_state: # For the Q&A chat
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# --- Predefined Clauses ---
+DEFAULT_CLAUSES_TO_CHECK = [
+    "Indemnification", "Limitation of Liability", "Intellectual Property Rights",
+    "Confidentiality", "Termination for Cause", "Governing Law & Jurisdiction",
+    "Data Privacy & Security", "Force Majeure"
+]
 
 # --- UI Layout ---
 
@@ -46,6 +52,19 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Upload Contract Document",
         type=["pdf", "docx", "png", "jpeg", "jpg"]
+    )
+
+    st.subheader("Clause Selection")
+    st.markdown("Predefined clauses will always be checked. Add more below!")
+    
+    # Display predefined clauses
+    st.info(f"**Default Clauses:** {', '.join(DEFAULT_CLAUSES_TO_CHECK)}")
+
+    # User input for additional clauses
+    user_custom_clauses_str = st.text_area(
+        "Additional Clauses to Verify (comma-separated)",
+        value="",
+        placeholder="e.g., Payment Terms, Warranty, Exclusivity"
     )
     
     analyze_button = st.button("Analyze Contract", type="primary", use_container_width=True)
@@ -75,10 +94,24 @@ if analyze_button:
         st.session_state.summary = None
         st.session_state.messages = []
 
+        # Combine default and user-defined clauses
+        all_clauses_to_check = list(DEFAULT_CLAUSES_TO_CHECK)
+        if user_custom_clauses_str:
+            custom_clauses = [c.strip() for c in user_custom_clauses_str.split(',') if c.strip()]
+            all_clauses_to_check.extend(custom_clauses)
+        
+        # Remove duplicates and ensure a consistent order
+        all_clauses_to_check = sorted(list(set(all_clauses_to_check)))
+
+        if not all_clauses_to_check:
+            st.warning("No clauses selected for verification. Please add some.")
+            st.stop() # Stop execution if no clauses are specified
+
         with st.spinner('AI is analyzing the document... This may take a moment.'):
             file_bytes = uploaded_file.getvalue()
             content_type = uploaded_file.type
             
+            text = ""
             if content_type == "application/pdf":
                 text = extract_text_from_pdf(file_bytes)
             elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -89,8 +122,8 @@ if analyze_button:
             st.session_state.contract_text = text
             
             if text:
-                # Call the main analysis function
-                results = asyncio.run(verify_contract_clauses(file_bytes, content_type, gemini_api_key))
+                # Call the main analysis function with the dynamic list of clauses
+                results = asyncio.run(verify_contract_clauses(file_bytes, content_type, gemini_api_key, all_clauses_to_check))
                 st.session_state.analysis_results = results
             else:
                 st.error("Could not extract text from the document.")
@@ -101,36 +134,61 @@ if st.session_state.analysis_results:
     results = st.session_state.analysis_results
     analysis = results.get("analysis", [])
     
-    # Display the summary if it has been generated
     if st.session_state.summary:
         st.subheader("Plain English Summary")
         st.info(st.session_state.summary)
 
     st.header("Contract Risk Analysis")
 
-    # Create columns for a dashboard-like view
-    col1, col2 = st.columns(2)
+    # Calculate percentages for overall metrics
+    total_clauses = len(analysis)
     high_risk_clauses = [item for item in analysis if item.get("risk_level") == "High"]
     medium_risk_clauses = [item for item in analysis if item.get("risk_level") == "Medium"]
+
+    if total_clauses > 0:
+        high_risk_percentage = (len(high_risk_clauses) / total_clauses) * 100
+        medium_risk_percentage = (len(medium_risk_clauses) / total_clauses) * 100
+    else:
+        high_risk_percentage = 0
+        medium_risk_percentage = 0
+
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("High-Risk Clauses", len(high_risk_clauses), delta_color="inverse")
+        st.metric(
+            "High-Risk Clauses",
+            f"{len(high_risk_clauses)} ({high_risk_percentage:.1f}%)",
+            delta_color="inverse"
+        )
     with col2:
-        st.metric("Medium-Risk Clauses", len(medium_risk_clauses), delta_color="inverse")
+        st.metric(
+            "Medium-Risk Clauses",
+            f"{len(medium_risk_clauses)} ({medium_risk_percentage:.1f}%)",
+            delta_color="inverse"
+        )
 
     st.divider()
 
-    # Display the detailed clause-by-clause analysis
+    # Display the detailed clause-by-clause analysis with risk percentages
     for item in analysis:
         risk_level = item.get("risk_level", "Low")
+        confidence = item.get("confidence_score", 0.0)
+        
+        # Determine the risk percentage for a single clause
+        if risk_level in ["High", "Medium"]:
+            risk_percent = 100
+        else:
+            risk_percent = 0
+
         icon = "🚨" if risk_level == "High" else "⚠️" if risk_level == "Medium" else "✅"
         
         with st.expander(f"{icon} **{item['clause_name']}** - Risk Level: {risk_level}"):
             st.markdown(f"**Justification:** {item['justification']}")
             if item['is_present']:
                 st.info(f"**Cited Text:** \"...{item['cited_text']}...\"")
-            st.progress(item['confidence_score'], text=f"Confidence: {item['confidence_score']:.0%}")
+
+            st.markdown(f"**Risk Percentage:** {risk_percent:.0f}%")
+            st.progress(confidence, text=f"Confidence: {confidence:.0%}")
             
-            # Add the "Suggest Fix" button for problematic clauses
             if risk_level in ["High", "Medium"]:
                 if st.button("Suggest Fix", key=f"suggest_{item['clause_name']}", use_container_width=True):
                     with st.spinner(f"AI is generating a suggestion for '{item['clause_name']}'..."):
@@ -144,23 +202,19 @@ if st.session_state.analysis_results:
                         st.subheader("AI-Generated Suggestion:")
                         st.text_area("", value=suggestion, height=200, key=f"suggestion_text_{item['clause_name']}")
 
-    # --- NEW: Feature 1 - Interactive Q&A Chat ---
+    # --- Interactive Q&A Chat ---
     st.divider()
     st.header("💬 Ask a Question About This Contract")
 
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Chat input for user's question
     if prompt := st.chat_input("What is the penalty for late payment?"):
-        # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Get AI response
         with st.chat_message("assistant"):
             with st.spinner("AI is thinking..."):
                 response = asyncio.run(
@@ -172,6 +226,4 @@ if st.session_state.analysis_results:
                 )
                 st.markdown(response)
         
-        # Add AI response to chat history
         st.session_state.messages.append({"role": "assistant", "content": response})
-
