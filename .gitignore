@@ -1,4 +1,45 @@
-.python-version
+# Python cache & build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyd
+*.pkl
+*.log
+
+# Virtual environments
 .venv/
 .env2/
+env/
+venv/
+
+# Environment / secret files
+.env
+*.env
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Pyenv / Python version files
+.python-version
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/
+.cache/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Custom ignored files
 x.py
