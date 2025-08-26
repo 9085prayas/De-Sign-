@@ -399,4 +399,3 @@ if st.session_state.analysis_results and st.session_state.analysis_results.get("
 
 elif analyze_button: # If analyze button clicked but no results (e.g., text extraction failed)
     st.error("Failed to perform analysis. Please check your API key and document format.")
-

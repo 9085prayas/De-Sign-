@@ -230,4 +230,3 @@ async def suggest_clause_fix(
 # Removed:     except Exception as e:
 # Removed:         logging.error(f"An unexpected server error occurred during /ask-question: {str(e)}", exc_info=True)
 # Removed:         raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {str(e)}")
-
