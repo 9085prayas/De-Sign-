@@ -1,438 +1,208 @@
-import os
-# import hashlib
-import re
-from datetime import datetime
-from typing import Dict, Any, List
-import uuid
+# In app/agents/agent_b.py
 
+import os
+import io
+import json
+import logging
+import asyncio
+from typing import Dict, Any
+
+# --- Copied imports from your original verifier.py ---
+from PIL import Image
+import pytesseract
+from docx import Document
+from PyPDF2 import PdfReader
+import google.generativeai as genai
+from cachetools import cached, TTLCache
+from pinecone import Pinecone
+
+# --- Copied functions and setup from your original verifier.py ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_clauses_to_check() -> list[str]:
+    """Loads the list of clauses from the JSON config file."""
+    try:
+        # Assumes clauses.json is in the project root, one level above the 'app' directory
+        with open("../clauses.json", 'r') as f:
+            clauses = json.load(f)
+            logging.info(f"Successfully loaded {len(clauses)} clauses to check from clauses.json")
+            return clauses
+    except FileNotFoundError:
+        logging.warning("clauses.json not found. Falling back to default list.")
+        return [
+            "Indemnification", "Limitation of Liability", "Intellectual Property Rights",
+            "Confidentiality", "Termination for Cause", "Governing Law & Jurisdiction"
+        ]
+
+CLAUSES_TO_CHECK = load_clauses_to_check()
+cache = TTLCache(maxsize=100, ttl=3600)
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+INDEX_NAME = "company-playbook"
+EMBEDDING_MODEL = "models/text-embedding-004"
+pinecone_index = None
+try:
+    if PINECONE_API_KEY:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        pinecone_index = pc.Index(INDEX_NAME)
+        logging.info("Successfully connected to Pinecone index.")
+    else:
+        logging.warning("PINECONE_API_KEY not found. RAG features will be disabled.")
+except Exception as e:
+    logging.warning(f"Could not connect to Pinecone. RAG features will be disabled. Error: {e}")
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+    return "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
+
+def extract_text_from_docx(docx_bytes: bytes) -> str:
+    document = Document(io.BytesIO(docx_bytes))
+    return "\n".join([para.text for para in document.paragraphs])
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    image = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(image)
+
+def retrieve_playbook_context(query: str, n_results: int = 3) -> str:
+    if not pinecone_index:
+        return "No playbook context available."
+    try:
+        query_embedding = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=query,
+            task_type="retrieval_query"
+        )['embedding']
+
+        results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=n_results,
+            include_metadata=True
+        )
+        
+        context = "\n---\n".join([match['metadata']['text'] for match in results['matches']])
+        logging.info(f"Retrieved context for query: '{query[:50]}...'")
+        return context
+    except Exception as e:
+        logging.error(f"Error retrieving from Pinecone: {e}")
+        return "Failed to retrieve playbook context."
+
+def generate_rag_llm_prompt(contract_text: str, playbook_context: str, clause_name: str) -> str:
+    return f"""
+    You are an expert AI paralegal specializing in contract risk analysis. Your primary goal is to ensure compliance with our company's legal playbook.
+
+    **Instructions:**
+    1.  **Analyze the Clause**: Read the provided clause text from the contract.
+    2.  **Consult the Playbook**: Review the relevant sections from our company's legal playbook provided below.
+    3.  **Compare and Assess Risk**: Compare the contract's clause against the playbook's guidance. Assign a risk level ('Low', 'Medium', 'High').
+    4.  **Justify**: Clearly explain *why* the clause has the assigned risk level, referencing specific points from the playbook.
+    5.  **Output Format**: Respond ONLY with a valid JSON object with the following structure:
+        {{
+          "clause_name": "{clause_name}",
+          "is_present": boolean,
+          "confidence_score": float,
+          "risk_level": "Low | Medium | High",
+          "justification": "Your analysis comparing the clause to the playbook.",
+          "cited_text": "The most relevant quote from the contract if present, otherwise an empty string."
+        }}
+
+    ---
+    **COMPANY PLAYBOOK CONTEXT for '{clause_name}':**
+    ---
+    {playbook_context}
+    ---
+    **CONTRACT TEXT:**
+    ---
+    {contract_text}
+    """
+
+@cached(cache)
+async def analyze_contract_text(contract_text: str, api_key: str):
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    all_analyses = []
+    for clause_name in CLAUSES_TO_CHECK:
+        logging.info(f"Analyzing clause: {clause_name}")
+        playbook_context = retrieve_playbook_context(f"Company policy for {clause_name} clause")
+        prompt = generate_rag_llm_prompt(contract_text, playbook_context, clause_name)
+        response = await model.generate_content_async(prompt)
+        try:
+            response_text = response.text.strip().replace("```json", "").replace("```", "")
+            parsed_clause = json.loads(response_text)
+            all_analyses.append(parsed_clause)
+        except (json.JSONDecodeError, AttributeError, ValueError) as e:
+            logging.warning(f"Could not decode or parse response for clause '{clause_name}'. Error: {e}. Skipping.")
+            all_analyses.append({
+                "clause_name": clause_name,
+                "is_present": False,
+                "confidence_score": 0.5,
+                "risk_level": "Medium",
+                "justification": f"AI failed to produce a valid analysis for this clause. Raw response: {response.text[:100]}...",
+                "cited_text": ""
+            })
+    return {"analysis": all_analyses}
+
+async def verify_contract_clauses(file_bytes: bytes, content_type: str, api_key: str):
+    text = ""
+    if content_type == "application/pdf":
+        text = extract_text_from_pdf(file_bytes)
+    elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        text = extract_text_from_docx(file_bytes)
+    elif content_type in ["image/jpeg", "image/png"]:
+        text = extract_text_from_image(file_bytes)
+    
+    if not text or not text.strip():
+        return {"error": "Could not extract any meaningful text from the uploaded file."}
+        
+    return await analyze_contract_text(text, api_key)
+
+
+# --- The New AgentB Class Integrating Your Logic ---
 class AgentB:
-    """Risk Assessment Agent B - Analyzes documents for risk indicators"""
+    """Risk Assessment Agent B - Powered by Gemini AI and RAG."""
     
     def __init__(self):
-        self.agent_name = "Agent B - Risk Assessment"
+        self.agent_name = "Agent B - AI Contract Analysis"
         
-        # Define risk keywords and their weights
-        self.risk_keywords = {
-            'high_risk': {
-                'keywords': [
-                    'urgent', 'critical', 'emergency', 'immediate', 'crisis',
-                    'lawsuit', 'legal action', 'breach', 'violation', 'fraud',
-                    'security incident', 'data leak', 'confidential leak',
-                    'deadline missed', 'overdue', 'expired', 'terminated',
-                    'audit finding', 'compliance issue', 'regulatory',
-                    'threat', 'vulnerability', 'attack', 'compromise'
-                ],
-                'weight': 10
-            },
-            'medium_risk': {
-                'keywords': [
-                    'important', 'priority', 'review required', 'attention needed',
-                    'pending approval', 'verification needed', 'clarification',
-                    'update required', 'modification', 'change request',
-                    'budget concern', 'resource issue', 'timeline concern',
-                    'quality issue', 'performance issue', 'delay possible',
-                    'stakeholder concern', 'client feedback', 'escalation'
-                ],
-                'weight': 5
-            },
-            'low_risk': {
-                'keywords': [
-                    'routine', 'standard', 'normal', 'regular', 'scheduled',
-                    'informational', 'update', 'notification', 'reminder',
-                    'confirmation', 'acknowledgment', 'status report',
-                    'meeting minutes', 'progress report', 'monthly report',
-                    'quarterly update', 'annual review', 'template',
-                    'guideline', 'procedure', 'policy update'
-                ],
-                'weight': 1
-            }
-        }
-        
-        # Document type patterns
-        self.document_types = {
-            'contract': ['agreement', 'contract', 'terms', 'conditions', 'clause'],
-            'financial': ['budget', 'invoice', 'payment', 'financial', 'cost', 'expense'],
-            'legal': ['legal', 'law', 'regulation', 'compliance', 'audit'],
-            'technical': ['specification', 'technical', 'system', 'software', 'hardware'],
-            'hr': ['employee', 'staff', 'personnel', 'hr', 'human resources'],
-            'general': []  # fallback
-        }
-    
     def analyze_file(self, file_path: str, additional_context: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Analyze uploaded file for risk indicators
-        
-        Args:
-            file_path: Path to the uploaded file
-            additional_context: Optional context (user info, metadata, etc.)
-            
-        Returns:
-            Dictionary containing risk assessment results
+        Analyzes the uploaded file using the Gemini AI and RAG pipeline.
+        This is the entry point called by the LangGraph workflow.
         """
         try:
-            print(f"[{self.agent_name}] Starting analysis of: {os.path.basename(file_path)}")
-            
-            # Read and process file content
-            content = self._read_file_content(file_path)
-            
-            if not content:
-                return self._create_error_response("Unable to read file content")
-            
-            # Perform various analyses
-            keyword_analysis = self._analyze_keywords(content)
-            document_analysis = self._analyze_document_structure(content)
-            content_analysis = self._analyze_content_patterns(content)
-            file_analysis = self._analyze_file_metadata(file_path)
-            
-            # Calculate overall risk score
-            risk_assessment = self._calculate_risk_level(
-                keyword_analysis, 
-                document_analysis, 
-                content_analysis,
-                file_analysis
-            )
-            
-            # Add context if provided
-            if additional_context:
-                risk_assessment['context'] = additional_context
-            
-            # Generate final assessment
-            final_assessment = self._generate_final_assessment(
-                risk_assessment,
-                keyword_analysis,
-                document_analysis,
-                content_analysis,
-                file_analysis
-            )
-            
-            print(f"[{self.agent_name}] Analysis complete - Risk Level: {final_assessment['risk_level']}")
-            
-            return final_assessment
-            
-        except Exception as e:
-            print(f"[{self.agent_name}] Analysis failed: {str(e)}")
-            return self._create_error_response(f"Analysis failed: {str(e)}")
-    
-    def _read_file_content(self, file_path: str) -> str:
-        """Read file content with multiple encoding attempts"""
-        encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-        
-        for encoding in encodings:
-            try:
-                with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
-                    return f.read()
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                print(f"Error reading file with {encoding}: {e}")
-                continue
-        
-        return ""
-    
-    def _analyze_keywords(self, content: str) -> Dict[str, Any]:
-        """Analyze content for risk-related keywords"""
-        content_lower = content.lower()
-        
-        analysis = {
-            'high_risk': {'count': 0, 'found_keywords': []},
-            'medium_risk': {'count': 0, 'found_keywords': []},
-            'low_risk': {'count': 0, 'found_keywords': []}
-        }
-        
-        for risk_level, data in self.risk_keywords.items():
-            for keyword in data['keywords']:
-                count = content_lower.count(keyword)
-                if count > 0:
-                    analysis[risk_level]['count'] += count * data['weight']
-                    analysis[risk_level]['found_keywords'].append({
-                        'keyword': keyword,
-                        'occurrences': count,
-                        'weight': data['weight']
-                    })
-        
-        return analysis
-    
-    def _analyze_document_structure(self, content: str) -> Dict[str, Any]:
-        """Analyze document structure and characteristics"""
-        lines = content.split('\n')
-        words = content.split()
-        sentences = re.split(r'[.!?]+', content)
-        
-        # Detect document type
-        document_type = self._detect_document_type(content)
-        
-        # Analyze structure
-        structure_analysis = {
-            'total_lines': len(lines),
-            'total_words': len(words),
-            'total_sentences': len([s for s in sentences if s.strip()]),
-            'average_words_per_sentence': len(words) / max(len([s for s in sentences if s.strip()]), 1),
-            'document_type': document_type,
-            'has_headers': self._has_headers(content),
-            'has_dates': self._has_dates(content),
-            'has_numbers': self._has_numbers(content),
-            'has_emails': self._has_emails(content),
-            'complexity_score': self._calculate_complexity(content)
-        }
-        
-        return structure_analysis
-    
-    def _analyze_content_patterns(self, content: str) -> Dict[str, Any]:
-        """Analyze content for specific risk patterns"""
-        patterns = {
-            'financial_amounts': len(re.findall(r'\$[\d,]+\.?\d*|USD\s*[\d,]+', content, re.IGNORECASE)),
-            'dates_mentioned': len(re.findall(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}', content)),
-            'email_addresses': len(re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content)),
-            'phone_numbers': len(re.findall(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', content)),
-            'urls': len(re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', content)),
-            'capital_words': len(re.findall(r'\b[A-Z]{2,}\b', content)),
-            'exclamation_marks': content.count('!'),
-            'question_marks': content.count('?')
-        }
-        
-        return patterns
-    
-    def _analyze_file_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Analyze file metadata"""
-        try:
-            stat = os.stat(file_path)
-            return {
-                'file_size': stat.st_size,
-                'file_name': os.path.basename(file_path),
-                'file_extension': os.path.splitext(file_path)[1].lower(),
-                'modified_time': datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                'created_time': datetime.fromtimestamp(stat.st_ctime).isoformat(),
+            print(f"[{self.agent_name}] Starting AI analysis of: {os.path.basename(file_path)}")
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+            if not gemini_api_key:
+                raise ValueError("GEMINI_API_KEY environment variable not set.")
+
+            with open(file_path, 'rb') as f:
+                file_bytes = f.read()
+
+            _, extension = os.path.splitext(file_path)
+            content_type_map = {
+                '.pdf': 'application/pdf',
+                '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'
             }
+            content_type = content_type_map.get(extension.lower())
+            if not content_type:
+                return self._create_error_response(f"Unsupported file type: {extension}")
+
+            # Run the async verification function
+            analysis_result = asyncio.run(verify_contract_clauses(
+                file_bytes=file_bytes,
+                content_type=content_type,
+                api_key=gemini_api_key
+            ))
+
+            if "error" in analysis_result:
+                return self._create_error_response(analysis_result["error"])
+
+            print(f"[{self.agent_name}] AI Analysis complete.")
+            return analysis_result
+
         except Exception as e:
-            return {'error': f"Could not analyze file metadata: {str(e)}"}
-    
-    def _calculate_risk_level(self, keyword_analysis: Dict, document_analysis: Dict, 
-                            content_analysis: Dict, file_analysis: Dict) -> Dict[str, Any]:
-        """Calculate overall risk level based on all analyses"""
-        
-        # Base risk score from keywords
-        high_risk_score = keyword_analysis['high_risk']['count']
-        medium_risk_score = keyword_analysis['medium_risk']['count']
-        low_risk_score = keyword_analysis['low_risk']['count']
-        
-        # Adjust based on document characteristics
-        if document_analysis.get('document_type') in ['legal', 'financial', 'contract']:
-            high_risk_score += 5
-        
-        # Adjust based on content patterns
-        if content_analysis.get('financial_amounts', 0) > 0:
-            medium_risk_score += 3
-        
-        if content_analysis.get('exclamation_marks', 0) > 5:
-            high_risk_score += 2
-        
-        # Adjust based on file size (very large files might be more complex)
-        file_size = file_analysis.get('file_size', 0)
-        if file_size > 100000:  # > 100KB
-            medium_risk_score += 1
-        
-        # Calculate total weighted score
-        total_score = (high_risk_score * 3) + (medium_risk_score * 2) + (low_risk_score * 1)
-        
-        # Determine risk level and confidence
-        if high_risk_score > 0 or total_score > 50:
-            risk_level = "HIGH RISK"
-            confidence = min(85 + high_risk_score, 95)
-        elif medium_risk_score > 0 or total_score > 20:
-            risk_level = "MEDIUM RISK"
-            confidence = min(70 + medium_risk_score, 85)
-        else:
-            risk_level = "LOW RISK"
-            confidence = max(50, min(60 + low_risk_score, 70))
-        
-        return {
-            'risk_level': risk_level,
-            'confidence': confidence,
-            'risk_score': total_score,
-            'component_scores': {
-                'high_risk': high_risk_score,
-                'medium_risk': medium_risk_score,
-                'low_risk': low_risk_score
-            }
-        }
-    
-    def _generate_final_assessment(self, risk_assessment: Dict, keyword_analysis: Dict,
-                                 document_analysis: Dict, content_analysis: Dict,
-                                 file_analysis: Dict) -> Dict[str, Any]:
-        """Generate final comprehensive assessment"""
-        
-        # Create summary
-        high_indicators = len(keyword_analysis['high_risk']['found_keywords'])
-        medium_indicators = len(keyword_analysis['medium_risk']['found_keywords'])
-        low_indicators = len(keyword_analysis['low_risk']['found_keywords'])
-        
-        summary = (f"Document analyzed with {risk_assessment['confidence']}% confidence. "
-                  f"Found {high_indicators} high-risk, {medium_indicators} medium-risk, "
-                  f"and {low_indicators} low-risk indicators.")
-        
-        # Generate recommendations
-        recommendations = self._get_recommendations(
-            risk_assessment['risk_level'],
-            keyword_analysis,
-            document_analysis
-        )
-        
-        return {
-            'risk_level': risk_assessment['risk_level'],
-            'confidence': risk_assessment['confidence'],
-            'risk_score': risk_assessment['risk_score'],
-            'summary': summary,
-            'recommendations': recommendations,
-            'analysis_details': {
-                'keyword_analysis': keyword_analysis,
-                'document_analysis': document_analysis,
-                'content_analysis': content_analysis,
-                'file_analysis': file_analysis,
-                'component_scores': risk_assessment['component_scores']
-            },
-            'analysis_id': f"RISK_{uuid.uuid4().hex[:8].upper()}",
-            'analyzed_at': datetime.now().isoformat(),
-            'agent_version': "1.0"
-        }
-    
-    def _detect_document_type(self, content: str) -> str:
-        """Detect document type based on content"""
-        content_lower = content.lower()
-        
-        for doc_type, keywords in self.document_types.items():
-            if doc_type == 'general':
-                continue
-            score = sum(1 for keyword in keywords if keyword in content_lower)
-            if score >= 2:  # Need at least 2 matching keywords
-                return doc_type
-        
-        return 'general'
-    
-    def _has_headers(self, content: str) -> bool:
-        """Check if document has header-like structures"""
-        lines = content.split('\n')
-        header_patterns = [
-            r'^[A-Z\s]+$',  # All caps lines
-            r'^\d+\.\s+[A-Z]',  # Numbered sections
-            r'^[A-Z][a-z]+:',  # Title: format
-        ]
-        
-        header_count = 0
-        for line in lines[:10]:  # Check first 10 lines
-            line = line.strip()
-            if any(re.match(pattern, line) for pattern in header_patterns):
-                header_count += 1
-        
-        return header_count > 0
-    
-    def _has_dates(self, content: str) -> bool:
-        """Check if document contains dates"""
-        date_patterns = [
-            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'\d{4}-\d{2}-\d{2}',
-            r'[A-Za-z]+ \d{1,2}, \d{4}'
-        ]
-        return any(re.search(pattern, content) for pattern in date_patterns)
-    
-    def _has_numbers(self, content: str) -> bool:
-        """Check if document contains significant numbers"""
-        return bool(re.search(r'\d+', content))
-    
-    def _has_emails(self, content: str) -> bool:
-        """Check if document contains email addresses"""
-        return bool(re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content))
-    
-    def _calculate_complexity(self, content: str) -> float:
-        """Calculate document complexity score"""
-        words = content.split()
-        if not words:
-            return 0
-        
-        # Average word length
-        avg_word_length = sum(len(word) for word in words) / len(words)
-        
-        # Sentence complexity (words per sentence)
-        sentences = re.split(r'[.!?]+', content)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        avg_sentence_length = len(words) / max(len(sentences), 1)
-        
-        # Unique word ratio
-        unique_words = len(set(word.lower() for word in words))
-        unique_ratio = unique_words / len(words)
-        
-        # Combine metrics (normalized to 0-100)
-        complexity = (
-            (min(avg_word_length, 10) / 10 * 30) +
-            (min(avg_sentence_length, 30) / 30 * 40) +
-            (unique_ratio * 30)
-        )
-        
-        return round(complexity, 2)
-    
-    def _get_recommendations(self, risk_level: str, keyword_analysis: Dict, 
-                           document_analysis: Dict) -> List[str]:
-        """Get recommendations based on risk level and analysis"""
-        base_recommendations = {
-            'HIGH RISK': [
-                'Immediate review required',
-                'Consider additional approval layers',
-                'Document all decisions carefully',
-                'Escalate to senior management if needed'
-            ],
-            'MEDIUM RISK': [
-                'Standard review process recommended',
-                'Verify key details before proceeding',
-                'Proceed with normal caution',
-                'Monitor for any changes'
-            ],
-            'LOW RISK': [
-                'Routine processing acceptable',
-                'Standard documentation sufficient',
-                'Regular monitoring adequate'
-            ]
-        }
-        
-        recommendations = base_recommendations.get(risk_level, ['Standard processing'])
-        
-        # Add specific recommendations based on analysis
-        if keyword_analysis['high_risk']['found_keywords']:
-            recommendations.append('Pay special attention to high-risk indicators found')
-        
-        if document_analysis.get('document_type') == 'legal':
-            recommendations.append('Legal review recommended')
-        elif document_analysis.get('document_type') == 'financial':
-            recommendations.append('Financial verification recommended')
-        
-        return recommendations
-    
+            logging.error(f"[{self.agent_name}] AI analysis failed: {e}", exc_info=True)
+            return self._create_error_response(f"An unexpected error occurred during AI analysis: {e}")
+            
     def _create_error_response(self, error_message: str) -> Dict[str, Any]:
-        """Create standardized error response"""
-        return {
-            'error': error_message,
-            'risk_level': 'UNKNOWN',
-            'confidence': 0,
-            'risk_score': 0,
-            'summary': f'Analysis failed: {error_message}',
-            'recommendations': ['Manual review required due to analysis failure'],
-            'analysis_details': {},
-            'analysis_id': f"ERR_{uuid.uuid4().hex[:8].upper()}",
-            'analyzed_at': datetime.now().isoformat(),
-            'agent_version': '1.0'
-        }
-    
-    def validate_file_for_analysis(self, file_path: str) -> bool:
-        """Validate if file can be analyzed"""
-        if not os.path.exists(file_path):
-            return False
-        
-        # Check file size (max 10MB)
-        if os.path.getsize(file_path) > 10 * 1024 * 1024:
-            return False
-        
-        # Check file extension
-        allowed_extensions = ['.txt', '.doc', '.docx', '.pdf', '.md', '.rtf']
-        _, ext = os.path.splitext(file_path)
-        if ext.lower() not in allowed_extensions:
-            return False
-        
-        return True
+        """Creates a standardized error response for the workflow."""
+        return {'error': error_message, 'analysis': []}

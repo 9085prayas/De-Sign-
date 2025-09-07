@@ -1,2 +1,5 @@
 .python-version
 .venv/
+.env
+playbooks/
+app.py
