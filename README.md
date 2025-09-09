@@ -6,7 +6,7 @@
 
 ## 🏆 Hackathon Submission
 - **Team Name:** ALT+F4  
-- **Team Members:** Prayas Chaware, Rishabh Parihar, Jay Gheewala, Punit Chaurasia, Laxman Rathode  
+- **Team Members:** Prayas Chaware, Rishabh Parihar, Jay Gheewala, Punit Chaurasia, Laxman Rathod 
 - **Hackathon Challenge Addressed:** Productivity & The Future of Work. This project showcases an autonomous system that significantly reduces manual effort, minimizes errors, and accelerates the contract approval process, representing the future of automated professional services.
 
 ---
