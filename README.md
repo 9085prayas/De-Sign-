@@ -15,20 +15,17 @@
 De-Sign is a stateful, multi-agent application orchestrated by LangGraph. The system manages a document's journey from initial upload to final scheduling through a series of specialized agents, pausing for critical human intervention when necessary.
 
 ### The Autonomous Agents:
-## Agent B (The Analyst):
-Function: Ingests a document (.pdf, .docx, .png, etc.) and performs a deep risk analysis.
+- ## Agent B (The Analyst):
+  - Function: Ingests a document (.pdf, .docx, .png, etc.) and performs a deep risk analysis.
+  - Intelligence: Utilizes a Retrieval-Augmented Generation (RAG) pipeline with Gemini and a Pinecone vector database (containing the company's legal playbook) to identify and score risks for key legal clauses.
 
-Intelligence: Utilizes a Retrieval-Augmented Generation (RAG) pipeline with Gemini and a Pinecone vector database (containing the company's legal playbook) to identify and score risks for key legal clauses.
+- ## Agent C (The Signer):
+  - Function: Once a human operator approves the analysis, this agent digitally signs the document.
+  - Process: It generates a document hash and a unique digital signature, embedding them into the workflow's state to ensure integrity.
 
-## Agent C (The Signer):
-Function: Once a human operator approves the analysis, this agent digitally signs the document.
-
-Process: It generates a document hash and a unique digital signature, embedding them into the workflow's state to ensure integrity.
-
-## Agent D (The Scheduler):
-Function: After the document is signed and a human provides a meeting date, this agent schedules the final review meeting.
-
-Process: It simulates creating a calendar event, generating a meeting ID, and confirming the schedule, marking the end of the workflow.
+- ## Agent D (The Scheduler):
+  - Function: After the document is signed and a human provides a meeting date, this agent schedules the final review meeting.
+  - Process: It simulates creating a calendar event, generating a meeting ID, and confirming the schedule, marking the end of the workflow.
 
 ### The Workflow Engine:
 The entire process is managed by a LangGraph state machine, which directs the flow of data between agents and pauses the workflow at two key checkpoints:
